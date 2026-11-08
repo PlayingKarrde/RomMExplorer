@@ -1,6 +1,6 @@
 [package]
 name = "romm-explorer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A modern desktop client to browse your RomM collection and install ROMs into a local, organised library."
 repository = "https://github.com/PlayingKarrde/RomMExplorer"
