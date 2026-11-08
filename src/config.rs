@@ -62,12 +62,63 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("RomMExplorer"))
 }
 
+/// Server details from a `.env` file (`server=`, `user=`, `password=`, optional
+/// `token=`), looked up in the working directory and next to the executable.
+/// Keys may also be prefixed with `ROMM_`.
+#[derive(Default, Debug, Clone)]
+pub struct DotEnv {
+    pub server: String,
+    pub user: String,
+    pub password: String,
+    pub token: String,
+}
+
+pub fn load_dotenv() -> Option<DotEnv> {
+    let mut candidates = vec![PathBuf::from(".env")];
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        candidates.push(dir.join(".env"));
+        // `target/release/` → project root, handy during development.
+        if let Some(root) = dir.parent().and_then(|p| p.parent()) {
+            candidates.push(root.join(".env"));
+        }
+    }
+    let text = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())?;
+    let mut env = DotEnv::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let key = k.trim().to_lowercase();
+        match key.strip_prefix("romm_").unwrap_or(&key) {
+            "server" | "url" | "server_url" => env.server = v,
+            "user" | "username" => env.user = v,
+            "password" | "pass" => env.password = v,
+            "token" | "api_token" => env.token = v,
+            _ => {}
+        }
+    }
+    (!env.server.is_empty()).then_some(env)
+}
+
 impl Config {
     pub fn load() -> Self {
-        std::fs::read_to_string(config_path())
+        let mut cfg: Config = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Pre-fill server details from .env when nothing is configured yet.
+        if cfg.server_url.trim().is_empty() {
+            if let Some(env) = load_dotenv() {
+                cfg.server_url = env.server;
+                cfg.username = env.user;
+                cfg.password = env.password;
+                cfg.api_token = env.token;
+            }
+        }
+        cfg
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

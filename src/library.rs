@@ -402,4 +402,61 @@ mod tests {
         assert!(leftovers.iter().all(|n| n.to_string_lossy().starts_with(".romm-explorer")), "{leftovers:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    /// Read-only smoke test against the server in `.env`; downloads the smallest
+    /// single-file rom into a temp folder and removes it again.
+    /// `cargo test real_server -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_server_smoke() {
+        let env = crate::config::load_dotenv().expect(".env with server details");
+        let auth = if env.token.is_empty() {
+            Auth::Basic { username: env.user.clone(), password: env.password.clone() }
+        } else {
+            Auth::Token(env.token.clone())
+        };
+        let client = RommClient::new(&env.server, auth, false).unwrap();
+        let user = client.current_user().unwrap();
+        let platforms = client.platforms().unwrap();
+        let mut roms = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (page, total, raw, paginated) = client.roms_page(offset, 500).unwrap();
+            assert_eq!(page.len(), raw, "some roms failed to deserialize");
+            roms.extend(page);
+            offset += raw as u64;
+            if !paginated || raw < 500 || total.is_some_and(|t| offset >= t) {
+                break;
+            }
+        }
+        println!("user={user} platforms={} roms={}", platforms.len(), roms.len());
+        let multi = roms.iter().filter(|r| r.is_multi()).count();
+        let with_cover = roms.iter().filter(|r| client.cover_url(r, false).is_some()).count();
+        println!("multi-file={multi} with_cover={with_cover}");
+
+        if let Some(r) = roms.iter().find(|r| client.cover_url(r, false).is_some()) {
+            let url = client.cover_url(r, false).unwrap();
+            let bytes = client.fetch_bytes(&url).unwrap();
+            image::load_from_memory(&bytes).expect("cover decodes");
+            println!("cover ok: {url} ({} bytes)", bytes.len());
+        }
+        if let Some(r) = roms.iter().find(|r| r.release_ts().is_some()) {
+            println!("metadata sample: {} year={:?} genres={:?} rating={:?}", r.title(), r.release_ts().and_then(crate::util::year_from_ts), r.genres(), r.rating());
+        }
+
+        let small = roms
+            .iter()
+            .filter(|r| !r.is_multi() && r.fs_size_bytes > 0 && r.fs_size_bytes < 64 << 20)
+            .min_by_key(|r| r.fs_size_bytes)
+            .expect("a small single-file rom");
+        let root = std::env::temp_dir().join(format!("romm-explorer-real-{}", std::process::id()));
+        let mut lib = Library::open(&root).unwrap();
+        let e = install(&client, small, &root, FolderNaming::FsSlug, true, &Progress::default()).unwrap();
+        println!("installed {} -> {} ({} bytes, expected {})", small.title(), e.rel_path.display(), e.size_bytes, small.fs_size_bytes);
+        assert_eq!(e.size_bytes, small.fs_size_bytes);
+        let id = e.rom_id;
+        lib.record(e).unwrap();
+        lib.uninstall(id).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

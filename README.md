@@ -62,6 +62,19 @@ cargo test
 ROMM_TEST_URL=http://localhost:8080 ROMM_TEST_USER=me ROMM_TEST_PASS=secret cargo test -- --ignored
 ```
 
+Server details can come from a `.env` file in the project root or next to the executable. They pre-fill the login screen when nothing is configured yet, and the real-server smoke test uses them. `.env` is git-ignored.
+
+```ini
+server=https://romm.example.com
+user=me
+password=secret
+# token=rmm_...   (optional, used instead of user/password)
+```
+
+```bash
+cargo test real_server -- --ignored --nocapture
+```
+
 Set `ROMM_EXPLORER_CONFIG=/path/to/config.json` to use a separate config file, for example while testing.
 
 ### Layout
