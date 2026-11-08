@@ -52,6 +52,7 @@ Turn on *Allow self-signed HTTPS certificates* if your server uses a self-signed
 > `%APPDATA%\RomMExplorer\RomMExplorer\config\config.json` on Windows,
 > `~/.config/rommexplorer/config.json` on Linux.
 > Prefer an API token over your password if that concerns you.
+> **Settings → Sign out** disconnects and deletes the saved password or token from this PC (the server address and username are kept).
 
 ## Development
 
@@ -62,7 +63,7 @@ cargo test
 ROMM_TEST_URL=http://localhost:8080 ROMM_TEST_USER=me ROMM_TEST_PASS=secret cargo test -- --ignored
 ```
 
-Server details can come from a `.env` file in the project root or next to the executable. They pre-fill the login screen when nothing is configured yet, and the real-server smoke test uses them. `.env` is git-ignored.
+In **development builds** (`cargo run`, `cargo test`), server details can come from a `.env` file in the project root. They pre-fill the login screen when nothing is configured yet, and the real-server smoke test uses them. Release builds never read `.env`. `.env` is git-ignored.
 
 ```ini
 server=https://romm.example.com

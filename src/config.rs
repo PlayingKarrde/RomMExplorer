@@ -64,9 +64,13 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("RomMExplorer"))
 }
 
-/// Server details from a `.env` file (`server=`, `user=`, `password=`, optional
-/// `token=`), looked up in the working directory and next to the executable.
-/// Keys may also be prefixed with `ROMM_`.
+/// Server details from the project's own `.env` file (`server=`, `user=`,
+/// `password=`, optional `token=`; keys may be prefixed with `ROMM_`).
+///
+/// Development builds only: release builds never read any `.env`, so a stray
+/// file next to a downloaded exe can't redirect someone's login elsewhere.
+/// Only the `.env` in this crate's source folder is considered.
+#[cfg(debug_assertions)]
 #[derive(Default, Debug, Clone)]
 pub struct DotEnv {
     pub server: String,
@@ -75,16 +79,9 @@ pub struct DotEnv {
     pub token: String,
 }
 
+#[cfg(debug_assertions)]
 pub fn load_dotenv() -> Option<DotEnv> {
-    let mut candidates = vec![PathBuf::from(".env")];
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        candidates.push(dir.join(".env"));
-        // `target/release/` → project root, handy during development.
-        if let Some(root) = dir.parent().and_then(|p| p.parent()) {
-            candidates.push(root.join(".env"));
-        }
-    }
-    let text = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())?;
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok()?;
     let mut env = DotEnv::default();
     for line in text.lines() {
         let line = line.trim();
@@ -107,20 +104,27 @@ pub fn load_dotenv() -> Option<DotEnv> {
 
 impl Config {
     pub fn load() -> Self {
-        let mut cfg: Config = std::fs::read_to_string(config_path())
+        let cfg: Config = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        // Pre-fill server details from .env when nothing is configured yet.
-        if cfg.server_url.trim().is_empty() {
+        #[cfg(debug_assertions)]
+        let cfg = cfg.with_dotenv();
+        cfg
+    }
+
+    /// Development builds: pre-fill from the project's .env when nothing is configured yet.
+    #[cfg(debug_assertions)]
+    fn with_dotenv(mut self) -> Self {
+        if self.server_url.trim().is_empty() {
             if let Some(env) = load_dotenv() {
-                cfg.server_url = env.server;
-                cfg.username = env.user;
-                cfg.password = env.password;
-                cfg.api_token = env.token;
+                self.server_url = env.server;
+                self.username = env.user;
+                self.password = env.password;
+                self.api_token = env.token;
             }
         }
-        cfg
+        self
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -140,6 +144,12 @@ impl Config {
         } else {
             Auth::None
         }
+    }
+
+    /// True when there is enough to log in without asking: a password or
+    /// token, or no username at all (servers that allow anonymous access).
+    pub fn has_credentials(&self) -> bool {
+        !self.password.is_empty() || !self.api_token.trim().is_empty() || self.username.trim().is_empty()
     }
 
     pub fn server_settings_differ(&self, other: &Config) -> bool {

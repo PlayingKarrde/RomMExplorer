@@ -408,6 +408,7 @@ mod tests {
     /// `cargo test real_server -- --ignored --nocapture`
     #[test]
     #[ignore]
+    #[cfg(debug_assertions)]
     fn real_server_smoke() {
         let env = crate::config::load_dotenv().expect(".env with server details");
         let auth = if env.token.is_empty() {

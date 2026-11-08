@@ -198,7 +198,7 @@ impl App {
         install_fonts(&cc.egui_ctx);
         apply(&cc.egui_ctx);
         let mut app = Self::with_config(&cc.egui_ctx, Config::load());
-        if !app.cfg.server_url.trim().is_empty() {
+        if !app.cfg.server_url.trim().is_empty() && app.cfg.has_credentials() {
             app.connect(&cc.egui_ctx);
         }
         app
@@ -360,6 +360,7 @@ impl App {
     fn process_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                Msg::Connected(_) if !matches!(self.conn, ConnState::Connecting) => {}
                 Msg::Connected(Ok((client, user))) => {
                     self.covers.set_client(Some(client.clone()));
                     self.client = Some(client);
@@ -1468,6 +1469,7 @@ impl App {
         let mut open = true;
         let mut save = false;
         let mut library_ops: Option<&'static str> = None;
+        let mut sign_out = false;
         egui::Window::new(RichText::new("Settings").font(bold(18.0)))
             .open(&mut open)
             .collapsible(false)
@@ -1477,6 +1479,24 @@ impl App {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 section_label(ui, "ROMM SERVER");
+                if let ConnState::Connected { user } = &self.conn {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.0, SUCCESS);
+                        let host = self.client.as_ref().map(|c| c.host()).unwrap_or_default();
+                        ui.label(RichText::new(format!("Signed in as {user} on {host}")).size(12.5).color(TEXT_DIM));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new(RichText::new("Sign out").color(lighten(DANGER, 0.25))).small())
+                                .on_hover_text("Disconnect and delete the saved password / token from this PC")
+                                .clicked()
+                            {
+                                sign_out = true;
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
                 save |= server_fields(ui, &mut self.draft);
                 ui.add_space(10.0);
 
@@ -1529,6 +1549,41 @@ impl App {
         if let Some(op) = library_ops {
             self.run_library_op(op);
         }
+        if sign_out {
+            self.show_settings = false;
+            self.sign_out();
+        }
+    }
+
+    /// Disconnects and removes the saved password/token from disk. The server
+    /// address and username stay filled in so signing back in is quick.
+    fn sign_out(&mut self) {
+        for d in &self.downloads {
+            if d.state == DlState::Running {
+                d.progress.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.cfg.password.clear();
+        self.cfg.api_token.clear();
+        self.draft = self.cfg.clone();
+        self.save_cfg();
+
+        self.client = None;
+        self.covers.set_client(None);
+        self.conn = ConnState::Idle;
+        self.load_gen += 1; // drop any library pages still in flight
+        self.roms.clear();
+        self.rom_index.clear();
+        self.search_keys.clear();
+        self.title_keys.clear();
+        self.platform_counts.clear();
+        self.platforms.clear();
+        self.filtered.clear();
+        self.filter_key = None;
+        self.roms_loading = false;
+        self.selected = None;
+        self.confirm_uninstall = None;
+        self.toast(ToastKind::Info, "Signed out. Your saved password has been removed from this PC.");
     }
 
     fn apply_settings(&mut self, ctx: &egui::Context) {
@@ -1852,6 +1907,11 @@ mod tests {
     }
 }
 
+/// Tests that point `ROMM_EXPLORER_CONFIG` at a temp file share one process
+/// environment, so they take turns.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod detail_panel_tests {
     use super::*;
@@ -1868,6 +1928,7 @@ mod detail_panel_tests {
 
     #[test]
     fn detail_panel_resizes_and_remembers_width() {
+        let _env = super::CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg_path = std::env::temp_dir().join(format!("romm-explorer-test-cfg-{}.json", std::process::id()));
         std::env::set_var("ROMM_EXPLORER_CONFIG", &cfg_path);
 
@@ -1931,6 +1992,58 @@ mod detail_panel_tests {
             frame_with(&ctx2, &mut app2, vec![]);
         }
         assert!((app2.cfg.detail_width - new_w).abs() < 1.0, "width drifted on reopen: {} -> {}", new_w, app2.cfg.detail_width);
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+}
+
+#[cfg(test)]
+mod sign_out_tests {
+    use super::*;
+    use crate::api::Auth;
+
+    #[test]
+    fn sign_out_forgets_saved_password() {
+        let _env = super::CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg_path = std::env::temp_dir().join(format!("romm-explorer-signout-{}.json", std::process::id()));
+        std::env::set_var("ROMM_EXPLORER_CONFIG", &cfg_path);
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply(&ctx);
+        let cfg = Config {
+            server_url: "https://romm.example.com".into(),
+            username: "someone".into(),
+            password: "hunter2".into(),
+            api_token: "rmm_secret".into(),
+            ..Default::default()
+        };
+        cfg.save().unwrap();
+        let mut app = App::with_config(&ctx, cfg);
+        let client = RommClient::new("http://127.0.0.1:9", Auth::None, false).unwrap();
+        app.client = Some(client.clone());
+        app.conn = ConnState::Connected { user: "someone".into() };
+        app.tx.send(Msg::RomsPage { gen: app.load_gen, roms: vec![Rom { id: 1, name: "A".into(), ..Default::default() }], total: Some(1), done: true }).unwrap();
+        let run = |app: &mut App| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))), ..Default::default() };
+            let _ = ctx.run(input, |ctx| app.frame(ctx));
+        };
+        run(&mut app);
+        assert_eq!(app.roms.len(), 1);
+
+        app.sign_out();
+        // A connection result that was still in flight must not sign us back in.
+        app.tx.send(Msg::Connected(Ok((client, "someone".into())))).unwrap();
+        run(&mut app);
+        run(&mut app);
+
+        assert!(app.client.is_none(), "still connected after sign out");
+        assert!(app.roms.is_empty());
+        let saved = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!saved.contains("hunter2") && !saved.contains("rmm_secret"), "secret left on disk: {saved}");
+        let saved: Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved.server_url, "https://romm.example.com");
+        assert_eq!(saved.username, "someone");
+        assert!(!saved.has_credentials(), "next launch would auto-connect with no password");
         let _ = std::fs::remove_file(&cfg_path);
     }
 }
