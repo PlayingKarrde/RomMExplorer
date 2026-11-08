@@ -195,12 +195,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         apply(&cc.egui_ctx);
+        let mut app = Self::with_config(&cc.egui_ctx, Config::load());
+        if !app.cfg.server_url.trim().is_empty() {
+            app.connect(&cc.egui_ctx);
+        }
+        app
+    }
 
-        let cfg = Config::load();
+    fn with_config(ctx: &egui::Context, cfg: Config) -> Self {
         let (tx, rx) = channel();
         let (job_tx, job_rx) = channel();
-        spawn_download_workers(job_rx, tx.clone(), cc.egui_ctx.clone());
-        let covers = CoverLoader::new(&cc.egui_ctx, 6, crate::config::cache_dir().join("covers"));
+        spawn_download_workers(job_rx, tx.clone(), ctx.clone());
+        let covers = CoverLoader::new(ctx, 6, crate::config::cache_dir().join("covers"));
 
         let mut toasts = Vec::new();
         let library = cfg.library_dir.as_ref().and_then(|d| match Library::open(d) {
@@ -211,7 +217,7 @@ impl App {
             }
         });
 
-        let mut app = Self {
+        Self {
             draft: cfg.clone(),
             cfg,
             client: None,
@@ -244,11 +250,7 @@ impl App {
             toasts,
             show_settings: false,
             confirm_uninstall: None,
-        };
-        if !app.cfg.server_url.trim().is_empty() {
-            app.connect(&cc.egui_ctx);
         }
-        app
     }
 
     // ───────────────────────────── helpers ─────────────────────────────
@@ -321,6 +323,8 @@ impl App {
         self.search_keys.clear();
         self.title_keys.clear();
         self.platform_counts.clear();
+        // Stale indices into `roms` must never outlive the list they point into.
+        self.filtered.clear();
         self.filter_key = None;
         self.roms_loading = true;
         self.roms_total = None;
@@ -698,7 +702,7 @@ impl App {
                         if icon_button(ui, "⚙", "Settings").clicked() {
                             self.open_settings();
                         }
-                        if icon_button(ui, "⟳", "Refresh from server").clicked() {
+                        if icon_button(ui, "⟳", "Refresh from server  (F5)").clicked() || ui.input(|i| i.key_pressed(egui::Key::F5)) {
                             self.reload(ui.ctx());
                         }
                         let mut view = self.cfg.view_mode;
@@ -967,7 +971,10 @@ impl App {
     fn detail_panel(&mut self, ctx: &egui::Context) {
         let Some(id) = self.selected else { return };
         let Some(rom) = self.rom(id).cloned() else {
-            self.selected = None;
+            // Keep the selection while a refresh is repopulating the list.
+            if !self.roms_loading {
+                self.selected = None;
+            }
             return;
         };
         let installed = self.library.as_ref().and_then(|l| l.get(id).map(|e| (e.clone(), l.abs_path(e))));
@@ -1151,7 +1158,7 @@ impl App {
                             let not_installed: Vec<i64> = self
                                 .filtered
                                 .iter()
-                                .map(|i| self.roms[*i].id)
+                                .filter_map(|i| self.roms.get(*i).map(|r| r.id))
                                 .filter(|id| !self.is_installed(*id) && self.active_download(*id).is_none())
                                 .collect();
                             if !not_installed.is_empty()
@@ -1230,6 +1237,9 @@ impl App {
     }
 
     fn grid_card(&mut self, ui: &mut Ui, idx: usize, w: f32, h: f32) {
+        if idx >= self.roms.len() {
+            return;
+        }
         let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
         if !ui.is_rect_visible(rect) {
             return;
@@ -1367,6 +1377,9 @@ impl App {
     }
 
     fn list_row(&mut self, ui: &mut Ui, idx: usize, h: f32) {
+        if idx >= self.roms.len() {
+            return;
+        }
         let w = ui.available_width() - 10.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
         if !ui.is_rect_visible(rect) {
@@ -1621,6 +1634,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl App {
+    fn frame(&mut self, ctx: &egui::Context) {
         self.process_messages(ctx);
         self.covers.poll(ctx);
 
@@ -1758,4 +1777,61 @@ fn library_field(ui: &mut Ui, dir: &mut Option<PathBuf>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Auth;
+
+    fn run_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }
+    }
+
+    /// Regression: refreshing used to empty `roms` while the grid still drew
+    /// stale indices in the same frame, panicking with index out of bounds.
+    #[test]
+    fn refresh_does_not_crash() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply(&ctx);
+        let mut app = App::with_config(&ctx, Config::default());
+        // Unreachable server: background reloads simply fail.
+        app.client = Some(RommClient::new("http://127.0.0.1:9", Auth::None, false).unwrap());
+        app.conn = ConnState::Connected { user: "test".into() };
+
+        let roms: Vec<Rom> = (1..=60)
+            .map(|i| Rom { id: i, name: format!("Game {i}"), platform_id: 1, fs_size_bytes: 1024, ..Default::default() })
+            .collect();
+        app.tx.send(Msg::RomsPage { gen: app.load_gen, roms, total: Some(60), done: true }).unwrap();
+
+        for view in [ViewMode::Grid, ViewMode::List] {
+            app.cfg.view_mode = view;
+            run_frame(&ctx, &mut app, vec![]);
+            run_frame(&ctx, &mut app, vec![]);
+            assert_eq!(app.filtered.len(), 60, "library should be visible before refresh");
+            app.selected = Some(5);
+
+            // Press refresh (F5 shares the button's code path) and keep drawing.
+            run_frame(&ctx, &mut app, vec![key(egui::Key::F5)]);
+            assert!(app.roms.is_empty() && app.roms_loading, "refresh should have started");
+            assert_eq!(app.selected, Some(5), "selection survives a refresh");
+            run_frame(&ctx, &mut app, vec![]);
+
+            // Repopulate for the next view mode.
+            let roms: Vec<Rom> = (1..=60)
+                .map(|i| Rom { id: i, name: format!("Game {i}"), platform_id: 1, ..Default::default() })
+                .collect();
+            app.tx.send(Msg::RomsPage { gen: app.load_gen, roms, total: Some(60), done: true }).unwrap();
+        }
+    }
 }
