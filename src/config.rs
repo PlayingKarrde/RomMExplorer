@@ -24,6 +24,7 @@ pub struct Config {
     pub extract_multi_file: bool,
     pub view_mode: ViewMode,
     pub card_width: f32,
+    pub detail_width: f32,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             extract_multi_file: true,
             view_mode: ViewMode::Grid,
             card_width: 168.0,
+            detail_width: 380.0,
         }
     }
 }

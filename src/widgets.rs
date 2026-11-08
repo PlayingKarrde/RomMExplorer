@@ -91,15 +91,28 @@ pub fn secondary_button(ui: &mut Ui, text: &str, color: Color32, width: f32) -> 
     r.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-pub fn chip(ui: &mut Ui, text: &str, color: Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.14))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.35)))
-        .corner_radius(20.0)
-        .inner_margin(egui::Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(12.0).color(lighten(color, 0.35)));
-        });
+/// A pill-shaped tag. Measured up front and allocated as one fixed-size
+/// block, so in a wrapping layout a chip that doesn't fit moves to the next
+/// row whole instead of its text wrapping inside it.
+pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
+    let fg = lighten(color, 0.35);
+    let pad = vec2(9.0, 4.0);
+    // Never wider than a full row; truncate with an ellipsis if it must.
+    let max_text_w = (ui.max_rect().width() - pad.x * 2.0).max(20.0);
+    let galley = truncated(ui, text, regular(12.0), fg, max_text_w);
+    let size = galley.size() + pad * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect, rect.height() / 2.0, color.gamma_multiply(0.14));
+        p.rect_stroke(rect, rect.height() / 2.0, Stroke::new(1.0_f32, color.gamma_multiply(0.35)), StrokeKind::Inside);
+        p.galley(rect.min + pad, galley.clone(), fg);
+    }
+    if galley.elided {
+        resp.on_hover_text(text)
+    } else {
+        resp
+    }
 }
 
 pub fn section_label(ui: &mut Ui, text: &str) {
@@ -168,4 +181,41 @@ pub fn progress_bar(painter: &egui::Painter, rect: Rect, fraction: f32, color: C
 
 pub fn card_border(painter: &egui::Painter, rect: Rect, radius: f32, color: Color32, width: f32) {
     painter.rect_stroke(rect, radius, Stroke::new(width, color), StrokeKind::Inside);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chips in a narrow wrapping row must stay one line tall and move to the
+    /// next row whole, never squashing their text.
+    #[test]
+    fn chips_wrap_without_squashing() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let tags = ["1998", "🌐 USA", "🌐 Europe", "En", "Role-playing (RPG)", "Turn-based strategy (TBS)", "Adventure", "Hack and slash/Beat 'em up", "A very very very long genre name that cannot fit on one row at all"];
+        let mut rects = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(vec2(300.0, 600.0), |ui| ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for t in tags {
+                        rects.push(chip(ui, t, ACCENT).rect);
+                    }
+                }));
+            });
+        });
+        let h = rects[0].height();
+        let left = rects.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min);
+        let rows: std::collections::BTreeSet<i32> = rects.iter().map(|r| r.top().round() as i32).collect();
+        for (t, r) in tags.iter().zip(&rects) {
+            assert!((r.height() - h).abs() < 0.5, "chip {t:?} is {} tall, expected {h}", r.height());
+            assert!(r.right() <= left + 300.5, "chip {t:?} overflows the row: {r:?}");
+        }
+        assert!(rows.len() >= 3, "expected chips to wrap onto several rows, got {rows:?}");
+    }
 }

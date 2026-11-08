@@ -20,6 +20,8 @@ use crate::widgets::*;
 
 const PAGE_SIZE: u64 = 500;
 const DOWNLOAD_WORKERS: usize = 2;
+const DETAIL_MIN_W: f32 = 320.0;
+const DETAIL_MAX_W: f32 = 760.0;
 
 enum Msg {
     Connected(Result<(RommClient, String), String>),
@@ -984,17 +986,19 @@ impl App {
         let large_url = self.client.as_ref().and_then(|c| c.cover_url(&rom, true));
         let tex = self.covers.get((id, true), large_url).or_else(|| self.covers.peek((id, false)));
 
-        egui::SidePanel::right("detail")
-            .exact_width(380.0)
-            .resizable(false)
+        let panel = egui::SidePanel::right("detail")
+            .resizable(true)
+            .default_width(self.cfg.detail_width.clamp(DETAIL_MIN_W, DETAIL_MAX_W))
+            .width_range(DETAIL_MIN_W..=DETAIL_MAX_W)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::same(18)).stroke(Stroke::new(1.0_f32, BORDER)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let w = ui.available_width();
 
-                    // Cover
-                    let h = (w * 4.0 / 3.0).min(460.0);
-                    let (cover_rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                    // Cover: keep the poster's 3:4 shape, centred, however wide the panel is.
+                    let h = (w * 4.0 / 3.0).min(560.0);
+                    let (row, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                    let cover_rect = Rect::from_center_size(row.center(), vec2((h * 0.75).min(w), h));
                     paint_cover(ui, cover_rect, tex.as_ref(), CornerRadius::same(14), &rom.platform_fs_slug, true);
                     let close = Rect::from_min_size(cover_rect.right_top() + vec2(-38.0, 8.0), vec2(30.0, 30.0));
                     let close_resp = ui.interact(close, Id::new("close-detail"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
@@ -1136,6 +1140,13 @@ impl App {
                     ui.add_space(12.0);
                 });
             });
+
+        // Remember the width the user dragged the panel to (saved once they let go).
+        let width = panel.response.rect.width();
+        if (width - self.cfg.detail_width).abs() > 0.5 && !ctx.input(|i| i.pointer.any_down()) {
+            self.cfg.detail_width = width;
+            self.save_cfg();
+        }
     }
 
     fn central(&mut self, ctx: &egui::Context) {
@@ -1525,7 +1536,12 @@ impl App {
         let reconnect = draft.server_settings_differ(&self.cfg) || !matches!(self.conn, ConnState::Connected { .. });
         let lib_changed = draft.library_dir != self.cfg.library_dir;
         let naming_changed = draft.folder_naming != self.cfg.folder_naming;
-        self.cfg = Config { view_mode: self.cfg.view_mode, card_width: self.cfg.card_width, ..draft };
+        self.cfg = Config {
+            view_mode: self.cfg.view_mode,
+            card_width: self.cfg.card_width,
+            detail_width: self.cfg.detail_width,
+            ..draft
+        };
         self.save_cfg();
         if lib_changed {
             match self.cfg.library_dir.clone() {
@@ -1833,5 +1849,88 @@ mod tests {
                 .collect();
             app.tx.send(Msg::RomsPage { gen: app.load_gen, roms, total: Some(60), done: true }).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod detail_panel_tests {
+    use super::*;
+    use crate::api::Auth;
+
+    fn frame_with(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+    }
+
+    #[test]
+    fn detail_panel_resizes_and_remembers_width() {
+        let cfg_path = std::env::temp_dir().join(format!("romm-explorer-test-cfg-{}.json", std::process::id()));
+        std::env::set_var("ROMM_EXPLORER_CONFIG", &cfg_path);
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply(&ctx);
+        let mut app = App::with_config(&ctx, Config::default());
+        app.client = Some(RommClient::new("http://127.0.0.1:9", Auth::None, false).unwrap());
+        app.conn = ConnState::Connected { user: "t".into() };
+        let rom = Rom {
+            id: 1,
+            name: "Test".into(),
+            platform_id: 1,
+            metadatum: serde_json::json!({"genres": ["Role-playing (RPG)", "Turn-based strategy (TBS)", "Hack and slash/Beat 'em up", "Adventure"]}),
+            regions: vec!["USA".into(), "Europe".into()],
+            ..Default::default()
+        };
+        app.tx.send(Msg::RomsPage { gen: app.load_gen, roms: vec![rom], total: Some(1), done: true }).unwrap();
+        app.selected = Some(1);
+
+        for _ in 0..3 {
+            frame_with(&ctx, &mut app, vec![]);
+        }
+        let start_w = app.cfg.detail_width;
+        assert!((start_w - 380.0).abs() < 1.0, "default width drifted to {start_w}");
+
+        // Drag the panel's left edge 200px to the left.
+        let edge_x = 1600.0 - start_w;
+        let y = 400.0;
+        let ptr = |x: f32| egui::Event::PointerMoved(pos2(x, y));
+        let btn = |x: f32, pressed: bool| egui::Event::PointerButton {
+            pos: pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame_with(&ctx, &mut app, vec![ptr(edge_x)]);
+        frame_with(&ctx, &mut app, vec![btn(edge_x, true)]);
+        for step in 1..=10 {
+            frame_with(&ctx, &mut app, vec![ptr(edge_x - 20.0 * step as f32)]);
+        }
+        frame_with(&ctx, &mut app, vec![btn(edge_x - 200.0, false)]);
+        for _ in 0..3 {
+            frame_with(&ctx, &mut app, vec![]);
+        }
+        let new_w = app.cfg.detail_width;
+        assert!((new_w - (start_w + 200.0)).abs() < 4.0, "expected ~{} after drag, got {new_w}", start_w + 200.0);
+
+        // Saved to disk, and a fresh app opens at the same width without drifting.
+        let saved: Config = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert!((saved.detail_width - new_w).abs() < 0.5);
+        let ctx2 = egui::Context::default();
+        install_fonts(&ctx2);
+        apply(&ctx2);
+        let mut app2 = App::with_config(&ctx2, saved);
+        app2.client = app.client.clone();
+        app2.conn = ConnState::Connected { user: "t".into() };
+        app2.tx.send(Msg::RomsPage { gen: app2.load_gen, roms: app.roms.clone(), total: Some(1), done: true }).unwrap();
+        app2.selected = Some(1);
+        for _ in 0..3 {
+            frame_with(&ctx2, &mut app2, vec![]);
+        }
+        assert!((app2.cfg.detail_width - new_w).abs() < 1.0, "width drifted on reopen: {} -> {}", new_w, app2.cfg.detail_width);
+        let _ = std::fs::remove_file(&cfg_path);
     }
 }
